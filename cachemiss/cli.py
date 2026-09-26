@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import __version__
-from .analysis import TTL, detect
+from .analysis import detect
 from .report import header, ledger, rollups, timeline, to_json, why
 from .transcripts import DEFAULT_ROOT, load_calls
 
@@ -28,9 +28,9 @@ def parse_since(text: str) -> datetime | None:
 
 def _load(args) -> tuple[list, datetime | None]:
     since = parse_since(args.since)
-    # Load a margin before the window so the first in-window call has its predecessor.
-    margin = since - max(TTL.values()) - timedelta(minutes=5) if since else None
-    calls = load_calls(Path(args.root), margin)
+    # Files touched in the window are read in full, so every in-window call has its
+    # predecessor even when that predecessor is older than the window.
+    calls = load_calls(Path(args.root), since)
     return calls, since
 
 
@@ -43,6 +43,7 @@ def cmd_ledger(args) -> int:
     summary = detect(calls)
     if since:
         summary.rebuilds = [r for r in summary.rebuilds if r.call.ts >= since]
+        summary.cold_starts = [c for c in summary.cold_starts if c.call.ts >= since]
         inwin = _window(calls, since)
         summary.calls = len(inwin)
         summary.sessions = len({c.session_id for c in inwin})
@@ -121,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_ledger)
     p = sub.add_parser("why", parents=[common], help="reasons, what they mean, what to do")
     p.set_defaults(func=cmd_ledger)
-    p = sub.add_parser("sessions", parents=[common], help="sessions in the window ranked by avoidable cost")
+    p = sub.add_parser("sessions", parents=[common], help="sessions in the window ranked by rebuild premium")
     p.set_defaults(func=cmd_sessions)
     p = sub.add_parser("session", help="one session as a timeline")
     p.add_argument("session", help="session id prefix or slug")
@@ -130,9 +131,13 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_session)
 
     argv = list(sys.argv[1:] if argv is None else argv)
-    known = {"ledger", "why", "sessions", "session", "-h", "--help", "--version"}
-    if not any(a in known for a in argv):
+    subcommands = ("ledger", "why", "sessions", "session")
+    found = next((a for a in argv if a in subcommands), None)
+    if found is None and not any(a in ("-h", "--help", "--version") for a in argv):
         argv = ["ledger", *argv]  # bare `cachemiss --since 24h` means the ledger
+    elif found is not None:
+        argv.remove(found)
+        argv = [found, *argv]  # `cachemiss --since 5h why` is fine too
     args = ap.parse_args(argv)
     return args.func(args)
 

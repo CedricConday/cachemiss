@@ -17,9 +17,11 @@ cachemiss --since 7d --json
 
 A Claude Code session is a chain of API calls that share a growing prompt. In a healthy
 chain each call reads the whole prefix from the prompt cache and writes only the last
-turn. A **rebuild** is a call that writes most of the prompt again: the cache entry
-expired, a sub-agent started from scratch, the tool list or system prompt changed, the
-history was compacted, or the model switched. Rebuilds are where a five-hour window goes.
+turn. A **rebuild** is a call that writes again what the previous call had already
+cached: the cache entry expired, the tool list or system prompt changed, the history was
+compacted, or the model switched. A **cold start** is the first call of a chain (a new
+session, a sub-agent, a fork); nothing was cached yet, so it is priced separately and
+never counted as a rebuild. Rebuilds are where a five-hour window goes.
 
 Real output from the machine this was written on, last 24 hours:
 
@@ -61,9 +63,36 @@ ba739404 majestic-puzzling-flask          1        4k    $0.09
 by model                                  n   rewrote  premium
 claude-fable-5-1                         10      986k   $17.83
 ```
+cachemiss  window: 24h   calls: 650   sessions: 34
+prompt tokens: 166521k   cache hit rate: 97%   written: 4187k   uncached input: 12k   output: 722k
+rebuilds: 5   tokens rewritten that were already cached: 739k   paid as writes: $14.78   as reads they would have cost: $0.18   rebuild premium: $14.59
+cold starts (not rebuilds): 38, of which 6 sub-agents; written: 1270k   paid: $12.66
+Dollar figures are API list prices for the same tokens, a proportion to compare, not a bill.
+API diagnostics present on 7 calls; other reasons are inferred.
 
-`cachemiss why` turns the reasons into plain language and a fix:
+when        session  agent              reason                               gap      rewrote  premium
+09-26 16:37 0f82a131 main               previous_message_not_found (gap>TTL) 3h00        357k    $7.05
+09-26 08:50 e7185911 main               previous_message_not_found (gap>TTL) 14h40       357k    $7.05
+09-26 09:50 ec11008d main               messages_changed                     12s          12k    $0.23
+09-26 09:13 e7185911 main               messages_changed                     8s            9k    $0.17
+09-26 10:25 ba739404 main               messages_changed                     2s            4k    $0.09
+* = reason inferred from the record (no API diagnostics on that call)
 
+by reason                                 n   rewrote  premium
+previous_message_not_found (gap>TTL)      2      714k   $14.10
+messages_changed                          3       25k    $0.50
+
+by agent                                  n   rewrote  premium
+main                                      5      739k   $14.59
+
+by session                                n   rewrote  premium
+e7185911 synthetic-squishing-platypus     2      366k    $7.22
+0f82a131 serialized-moseying-snowglobe    1      357k    $7.05
+ec11008d                                  1       12k    $0.23
+ba739404 majestic-puzzling-flask          1        4k    $0.09
+
+by model                                  n   rewrote  premium
+claude-fable-5-1                          5      739k   $14.59
 ```
 cachemiss  window: 24h   calls: 624   sessions: 34
 prompt tokens: 152450k   cache hit rate: 97%   written: 3959k   uncached input: 12k   output: 692k
@@ -83,52 +112,20 @@ messages_changed (API diagnostics): 3 rebuilds, 25k tokens rewritten, $0.50 prem
   what it means: The message history differs from the previous request before the last turn: earlier messages were edited, compacted or reordered.
   what to do:    Usually compaction or a resumed session; unavoidable, but worth knowing when it happened.
 ```
+cachemiss  window: 24h   calls: 650   sessions: 34
+prompt tokens: 166521k   cache hit rate: 97%   written: 4187k   uncached input: 12k   output: 722k
+rebuilds: 5   tokens rewritten that were already cached: 739k   paid as writes: $14.78   as reads they would have cost: $0.18   rebuild premium: $14.59
+cold starts (not rebuilds): 38, of which 6 sub-agents; written: 1270k   paid: $12.66
+Dollar figures are API list prices for the same tokens, a proportion to compare, not a bill.
+API diagnostics present on 7 calls; other reasons are inferred.
 
-## Where the reasons come from
+previous_message_not_found (API diagnostics): 2 rebuilds, 714k tokens rewritten, $14.10 premium, avoidable
+  what it means: The API had no fingerprint of the previous request to compare against. In Claude Code this is what an expired cache entry, an aborted request or a fresh chain looks like.
+  what to do:    Same as ttl_expired when it follows a long gap; otherwise the previous request carried no diagnostics.
 
-Claude Code records `usage` for every API call. Newer versions also record the API's own
-**cache diagnostics** on some calls (`message.diagnostics.cache_miss_reason`): the API
-compared the request with the previous one and says whether the model, the system
-prompt, the tool list or the message history changed, or whether it had nothing to
-compare against (`previous_message_not_found`, which is what an expired entry or a fresh
-chain looks like). Those reasons are shown as they are.
-
-Calls without diagnostics get an **inferred** reason, marked with `*`, from what the
-record does show: the gap to the previous call against the entry's TTL (Claude Code
-writes the main conversation to the 1-hour cache and sub-agents to the 5-minute one),
-the first call of a sub-agent, a model or CLI version change, or a prompt that shrank
-(compaction). What is left is `prefix_changed*`: something before the last turn changed
-and only the diagnostics beta can say what.
-
-## Numbers, stated plainly
-
-* **rewrote**: tokens written to the cache that were already cached on the previous
-  call of the same chain. A session's first call writes everything and is not counted.
-* **premium**: what those tokens cost as a cache write (1.25x input price on the
-  5-minute cache, 2x on the 1-hour cache) minus what they would have cost as a cache
-  read (0.1x, 0.025x on Claude Fable 5.1, 0.05x on Claude Opus 5.5). Prices are the
-  Anthropic API list prices per model. A subscription is not billed in dollars, but the
-  tokens are the same tokens; treat the figure as a proportion, not a bill.
-* **avoidable vs expected** (`cachemiss why`): an expired entry, a changed tool list,
-  an edited system prompt or a model switch can be avoided; a sub-agent's first call,
-  compaction and history edits are the price of the feature.
-* A rebuild is counted when at least half of a prompt of 4k tokens or more was
-  written, or when the API diagnostics flagged the call and at least 4k tokens were
-  written. Thresholds are constants at the top of `cachemiss/analysis.py`.
-
-## What it does not do
-
-* It does not read your conversation content; only the usage and metadata fields of
-  `assistant` records.
-* It does not talk to any network. There is no telemetry.
-* It does not know your plan's quota formula. Anthropic does not publish one; the tool
-  reports tokens and their API value and lets you draw the proportion.
-* It is not an official Anthropic tool. Transcript fields can change between Claude Code
-  versions; the reader is tolerant of missing fields and the tests pin the shapes seen
-  on 2.1.228 through 2.1.283.
-
-## Development
-
+messages_changed (API diagnostics): 3 rebuilds, 25k tokens rewritten, $0.50 premium, expected
+  what it means: The message history differs from the previous request before the last turn: earlier messages were edited, compacted or reordered.
+  what to do:    Usually compaction or a resumed session; unavoidable, but worth knowing when it happened.
 ```bash
 pip install -e ".[dev]"
 pytest -q
@@ -136,8 +133,10 @@ ruff check cachemiss tests
 ```
 
 The tests generate synthetic transcripts with known cache behaviour (a healthy loop, an
-expired 1-hour entry, a sub-agent on the 5-minute cache, a model switch, compaction,
-multi-block responses) and check that every rebuild is attributed to the right reason
-with the right token count, before anything is claimed about real transcripts.
+expired 1-hour entry, a sub-agent on the 5-minute cache, a model switch, compaction, a
+growing prompt, a partial rebuild, a fork, error records, multi-block responses, a
+window that starts after the break) and check that every rebuild is attributed to the
+right reason with the right token count, before anything is claimed about real
+transcripts.
 
 MIT. Written by Cedric Conday with Claude (Anthropic) as coding partner.

@@ -42,6 +42,7 @@ class Call:
     creation_5m: int
     creation_1h: int
     reason: str | None  # diagnostics.cache_miss_reason.type when present
+    missed: int | None = None  # diagnostics.cache_miss_reason.cache_missed_input_tokens
     quota: dict | None = None
     effort: str | None = None
     slug: str | None = None
@@ -104,6 +105,8 @@ def read_file(path: Path, root: Path = DEFAULT_ROOT) -> Iterator[Call]:
             u = m.get("usage") or {}
             if not u:
                 continue
+            if m.get("model") == "<synthetic>" or d.get("isApiErrorMessage"):
+                continue  # a failed request; no prompt was cached or read
             rid = d.get("requestId") or m.get("id")
             if rid:
                 if rid in seen:
@@ -114,6 +117,9 @@ def read_file(path: Path, root: Path = DEFAULT_ROOT) -> Iterator[Call]:
                 continue
             cc = u.get("cache_creation") or {}
             diag = (m.get("diagnostics") or {}).get("cache_miss_reason") or {}
+            prompt = int(u.get("input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0)
+            if prompt == 0:
+                continue  # nothing was sent; keeps zero-usage blocks out of the chain
             yield Call(
                 ts=ts,
                 file=str(path),
@@ -133,6 +139,7 @@ def read_file(path: Path, root: Path = DEFAULT_ROOT) -> Iterator[Call]:
                 creation_5m=int(cc.get("ephemeral_5m_input_tokens") or 0),
                 creation_1h=int(cc.get("ephemeral_1h_input_tokens") or 0),
                 reason=diag.get("type"),
+                missed=diag.get("cache_missed_input_tokens"),
                 quota=d.get("quotaLimits"),
                 effort=d.get("effort"),
                 slug=d.get("slug"),
@@ -140,10 +147,12 @@ def read_file(path: Path, root: Path = DEFAULT_ROOT) -> Iterator[Call]:
 
 
 def load_calls(root: Path = DEFAULT_ROOT, since: datetime | None = None) -> list[Call]:
-    """Every API call under ``root``, oldest first, optionally from ``since`` on.
+    """Every API call under ``root``, oldest first.
 
-    Files whose modification time predates ``since`` are skipped without
-    parsing, which keeps a 5-hour window fast on a large history.
+    With ``since``, files not modified since then are skipped without parsing,
+    which keeps a 5-hour window fast on a large history. Files that were
+    touched are read in full, so the first in-window call of a chain still has
+    its predecessor; the report layer filters calls to the window.
     """
     calls: list[Call] = []
     for path in iter_files(root):
@@ -151,8 +160,6 @@ def load_calls(root: Path = DEFAULT_ROOT, since: datetime | None = None) -> list
             mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
             if mtime < since:
                 continue
-        for call in read_file(path, root):
-            if since is None or call.ts >= since:
-                calls.append(call)
+        calls.extend(read_file(path, root))
     calls.sort(key=lambda c: c.ts)
     return calls

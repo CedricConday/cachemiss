@@ -1,8 +1,14 @@
 """Turn a sequence of calls into rebuild events with a reason, a cost and a culprit.
 
-A *rebuild* is a call that wrote to the cache a large share of a prompt that
-had already been cached on the previous call of the same chain. The healthy
-loop writes only the delta of the last turn; a rebuild rewrites what was there.
+A *rebuild* is a call that wrote to the cache tokens that were already cached
+on the previous call of the same chain: what the previous call had cached
+minus what this call read back, capped by what this call wrote. The healthy
+loop reads everything cached so far and writes only the last turn.
+
+A *cold start* is the first call of a chain: a session's first call, a
+sub-agent's first call, or a forked session copying its parent's history.
+Nothing was cached before, so nothing was rewritten; it is reported and priced
+separately, never counted as a rebuild.
 
 Reasons come from the API's own cache diagnostics when the transcript has
 them (``messages_changed``, ``tools_changed``, ``system_changed``,
@@ -31,9 +37,8 @@ from datetime import timedelta
 from .pricing import price_for
 from .transcripts import Call
 
-TTL = {"1h": timedelta(hours=1), "5m": timedelta(minutes=5), "mixed": timedelta(minutes=5), "none": timedelta(minutes=5)}
-MIN_PROMPT = 4000  # below this a rewrite is noise, not a rebuild
-REBUILD_SHARE = 0.5  # share of the prompt written to cache that counts as a rebuild
+TTL = {"1h": timedelta(hours=1), "5m": timedelta(minutes=5)}
+MIN_PROMPT = 4000  # fewer rewritten tokens than this is noise, not a rebuild
 SHRINK_SHARE = 0.7  # prompt smaller than this share of the previous one = compaction
 
 API_REASONS = {
@@ -46,6 +51,7 @@ API_REASONS = {
 }
 INFERRED_REASONS = {
     "subagent_start": "A sub-agent started; it builds its own prefix from scratch, on the 5-minute cache.",
+    "session_start": "A session's first call, or a forked session copying its parent's history; nothing was cached yet.",
     "ttl_expired": "The previous cache entry had expired before this call; the whole prefix was written again.",
     "model_changed": "A different model served this call; caches are per model.",
     "cli_version_changed": "Claude Code was updated between calls; the system prompt and tool set changed with it.",
@@ -78,6 +84,7 @@ class Rebuild:
     write_cost: float  # dollars paid to write the rebuilt tokens
     read_cost: float  # what the same tokens would have cost as a cache read
     share: float  # share of this prompt that was written
+    chain_ttl: str = "1h"  # TTL the chain's cache entries carried before this call
 
     @property
     def premium(self) -> float:
@@ -91,10 +98,18 @@ class Rebuild:
         expired = (
             self.reason == "previous_message_not_found"
             and self.gap is not None
-            and self.prev is not None
-            and self.gap > TTL.get(self.prev.ttl, TTL["5m"])
+            and self.gap > TTL[self.chain_ttl]
         )
         return f"{self.reason} (gap>TTL)" if expired else self.reason + tag
+
+
+@dataclass
+class ColdStart:
+    call: Call
+    kind: str  # session_start or subagent_start
+    written: int
+    write_cost: float
+
 
 
 @dataclass
@@ -107,6 +122,7 @@ class Summary:
     input_tokens: int = 0
     output_tokens: int = 0
     rebuilds: list[Rebuild] = field(default_factory=list)
+    cold_starts: list[ColdStart] = field(default_factory=list)
     diagnostics_present: int = 0
 
     @property
@@ -131,10 +147,19 @@ class Summary:
         return dict(sorted(out.items(), key=lambda kv: -kv[1]["premium"]))
 
 
-def infer_reason(call: Call, prev: Call | None, gap: timedelta | None) -> str:
+def chain_ttl_after(previous: str, call: Call) -> str:
+    """The TTL the chain's entries carry after ``call``: a pure read keeps the old one."""
+    if call.ttl in ("1h", "mixed"):
+        return "1h"
+    if call.ttl == "5m":
+        return "5m"
+    return previous
+
+
+def infer_reason(call: Call, prev: Call | None, gap: timedelta | None, chain_ttl: str) -> str:
     if prev is None:
         return "subagent_start" if call.is_subagent else "session_start"
-    if gap is not None and gap > TTL.get(prev.ttl, TTL["5m"]):
+    if gap is not None and gap > TTL[chain_ttl]:
         return "ttl_expired"
     if call.model != prev.model:
         return "model_changed"
@@ -150,6 +175,7 @@ def detect(calls: list[Call]) -> Summary:
     summary = Summary(calls=len(calls))
     summary.sessions = len({c.session_id for c in calls})
     last: dict[str, Call] = {}
+    ttl_of: dict[str, str] = {}
     for call in calls:
         summary.prompt_tokens += call.prompt_tokens
         summary.cache_read += call.cache_read
@@ -159,26 +185,30 @@ def detect(calls: list[Call]) -> Summary:
         if call.reason:
             summary.diagnostics_present += 1
         prev = last.get(call.chain)
+        chain_ttl = ttl_of.get(call.chain, "1h" if not call.is_subagent else "5m")
         last[call.chain] = call
-        gap = (call.ts - prev.ts) if prev else None
-        share = call.cache_creation / call.prompt_tokens if call.prompt_tokens else 0.0
-        big = call.prompt_tokens >= MIN_PROMPT and share >= REBUILD_SHARE
-        if not big and (not call.reason or call.cache_creation < MIN_PROMPT):
-            # Either nothing much was rewritten, or the API flagged a miss that cost
-            # next to nothing. Neither belongs in a ledger of what drained the quota.
-            continue
-        previously_cached = prev.prompt_tokens if prev else 0
-        rebuilt = min(call.cache_creation, previously_cached) if prev else call.cache_creation
-        if prev is None and not call.is_subagent:
-            # The first call of a session writes everything; that is not a rebuild.
-            continue
-        reason = call.reason or infer_reason(call, prev, gap)
-        inferred = call.reason is None
+        ttl_of[call.chain] = chain_ttl_after(chain_ttl, call)
         price = price_for(call.model)
+
+        if prev is None:
+            if call.cache_creation >= MIN_PROMPT:
+                kind = "subagent_start" if call.is_subagent else "session_start"
+                cost = call.cache_creation / 1e6 * price.write_per_m(call.ttl)
+                summary.cold_starts.append(ColdStart(call, kind, call.cache_creation, cost))
+            continue
+
+        gap = call.ts - prev.ts
+        previously_cached = prev.cache_read + prev.cache_creation
+        lost = call.missed if call.missed is not None else max(0, previously_cached - call.cache_read)
+        rebuilt = min(lost, call.cache_creation)
+        if rebuilt < MIN_PROMPT:
+            continue
+        reason = call.reason or infer_reason(call, prev, gap, chain_ttl)
+        share = call.cache_creation / call.prompt_tokens if call.prompt_tokens else 0.0
         write_cost = rebuilt / 1e6 * price.write_per_m(call.ttl)
         read_cost = rebuilt / 1e6 * price.read_per_m
         summary.rebuilds.append(
-            Rebuild(call, prev, reason, inferred, rebuilt, gap, write_cost, read_cost, share)
+            Rebuild(call, prev, reason, call.reason is None, rebuilt, gap, write_cost, read_cost, share, chain_ttl)
         )
     return summary
 

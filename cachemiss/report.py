@@ -47,7 +47,14 @@ def header(summary: Summary, since: datetime | None, label: str) -> str:
         f"as reads they would have cost: {_money(sum(r.read_cost for r in summary.rebuilds))}   "
         f"rebuild premium: {_money(summary.premium)}"
     )
-    lines.append("Dollar figures are API list prices for the same tokens; a subscription quota is not billed in dollars, but it drains in the same proportion.")
+    cold = summary.cold_starts
+    if cold:
+        subs = [c for c in cold if c.kind == "subagent_start"]
+        lines.append(
+            f"cold starts (not rebuilds): {len(cold)}, of which {len(subs)} sub-agents; "
+            f"written: {_k(sum(c.written for c in cold))}   paid: {_money(sum(c.write_cost for c in cold))}"
+        )
+    lines.append("Dollar figures are API list prices for the same tokens, a proportion to compare, not a bill.")
     if summary.diagnostics_present:
         lines.append(f"API diagnostics present on {summary.diagnostics_present} calls; other reasons are inferred.")
     else:
@@ -109,12 +116,16 @@ def why(summary: Summary) -> str:
 def timeline(calls, summary: Summary) -> str:
     """Per-call view of one session: prompt size, hit share, and rebuild markers."""
     marks = {id(r.call): r for r in summary.rebuilds}
+    colds = {id(c.call): c for c in summary.cold_starts}
     out = [f"{'when':11} {'agent':14} {'prompt':>8} {'read':>8} {'wrote':>8} {'hit':>5}  note"]
     for c in calls:
         hit = c.cache_read / c.prompt_tokens if c.prompt_tokens else 0
         agent = (c.agent_name or ("sub-agent" if c.is_subagent else "main"))[:14]
         r = marks.get(id(c))
         note = f"REBUILD {r.label} {_k(r.rebuilt_tokens)} tokens, gap {_gap(r.gap)}" if r else ""
+        cold = colds.get(id(c))
+        if cold:
+            note = f"COLD START {cold.kind} {_k(cold.written)} tokens"
         if c.quota:
             note += f" quota:{c.quota.get('status')}"
         out.append(f"{_local(c.ts):11} {agent:14} {_k(c.prompt_tokens):>8} {_k(c.cache_read):>8} {_k(c.cache_creation):>8} {hit:>5.0%}  {note}")
@@ -146,7 +157,11 @@ def to_json(summary: Summary, since: datetime | None) -> dict:
                 "model": r.call.model,
                 "reason": r.reason,
                 "inferred": r.inferred,
-                "gap_seconds": r.gap.total_seconds() if r.gap else None,
+                "gap_seconds": r.gap.total_seconds() if r.gap is not None else None,
+                "version": r.call.version,
+                "api_missed_tokens": r.call.missed,
+                "written_5m": r.call.creation_5m,
+                "written_1h": r.call.creation_1h,
                 "rebuilt_tokens": r.rebuilt_tokens,
                 "prompt_tokens": r.call.prompt_tokens,
                 "share_written": r.share,
@@ -159,5 +174,17 @@ def to_json(summary: Summary, since: datetime | None) -> dict:
                 "request_id": r.call.request_id,
             }
             for r in summary.rebuilds
+        ],
+        "cold_starts": [
+            {
+                "ts": c.call.ts.isoformat(),
+                "session_id": c.call.session_id,
+                "agent": c.call.agent_name,
+                "kind": c.kind,
+                "written": c.written,
+                "write_cost": c.write_cost,
+                "model": c.call.model,
+            }
+            for c in summary.cold_starts
         ],
     }
