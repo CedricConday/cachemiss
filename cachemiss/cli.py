@@ -10,9 +10,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import __version__
-from .analysis import detect
+from .analysis import Classifier, ColdStart, Rebuild, detect
 from .report import header, ledger, rollups, timeline, to_json, why
-from .transcripts import DEFAULT_ROOT, load_calls
+from .transcripts import DEFAULT_ROOT, iter_files, load_calls, read_new
 
 _UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
 
@@ -106,6 +106,87 @@ def cmd_sessions(args) -> int:
     return 0
 
 
+class Watcher:
+    """Follows the transcript tree and classifies each API call as its record lands.
+
+    On start it feeds the recent history (files modified within ``prime``) to the
+    classifier silently, so every live chain has its predecessor; then each poll reads
+    only the bytes appended since the last one.
+    """
+
+    def __init__(self, root: Path, prime: datetime | None) -> None:
+        self.root = root
+        self.clf = Classifier()
+        self.offsets: dict[Path, int] = {}
+        self.seen: dict[Path, set[str]] = {}
+        self.events: list[Rebuild | ColdStart] = []
+        for path in iter_files(root):
+            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            if prime is not None and mtime >= prime:
+                calls, offset = read_new(path, 0, root, self.seen.setdefault(path, set()))
+                for call in sorted(calls, key=lambda c: c.ts):
+                    self.clf.feed(call)
+                self.offsets[path] = offset
+            else:
+                self.offsets[path] = path.stat().st_size
+
+    def poll(self) -> list[Rebuild | ColdStart]:
+        """One pass over the tree; returns the events from records appended since the last pass."""
+        fresh: list = []
+        for path in iter_files(self.root):
+            offset = self.offsets.get(path, 0)
+            if path.stat().st_size <= offset:
+                continue
+            calls, new_offset = read_new(path, offset, self.root, self.seen.setdefault(path, set()))
+            self.offsets[path] = new_offset
+            fresh.extend(calls)
+        out = []
+        for call in sorted(fresh, key=lambda c: c.ts):
+            event = self.clf.feed(call)
+            if event is not None:
+                out.append(event)
+        self.events.extend(out)
+        return out
+
+
+def _event_line(event: Rebuild | ColdStart) -> str:
+    from .report import _gap, _k, _local, _money, _short  # same formatting as the ledger
+
+    c = event.call
+    agent = (c.agent_name or ("sub-agent" if c.is_subagent else "main"))[:18]
+    if isinstance(event, ColdStart):
+        return f"{_local(c.ts):11} {_short(c.session_id):8} {agent:18} {event.kind:36} {'':7} {_k(event.written):>8} {_money(event.write_cost):>8}  cold start"
+    return f"{_local(c.ts):11} {_short(c.session_id):8} {agent:18} {event.label:36} {_gap(event.gap):7} {_k(event.rebuilt_tokens):>8} {_money(event.premium):>8}"
+
+
+def cmd_watch(args) -> int:
+    import time
+
+    root = Path(args.root)
+    prime = datetime.now(timezone.utc) - timedelta(hours=args.prime_hours)
+    w = Watcher(root, prime)
+    chains = len(w.clf.last)
+    print(f"watching {root} every {args.interval}s; {chains} chain(s) primed from the last {args.prime_hours}h. Ctrl-C to stop.")
+    print(f"{'when':11} {'session':8} {'agent':18} {'reason':36} {'gap':7} {'rewrote':>8} {'premium':>8}")
+    try:
+        while True:
+            for event in w.poll():
+                if args.json:
+                    print(json.dumps({"kind": "cold_start" if isinstance(event, ColdStart) else "rebuild", "line": _event_line(event)}))
+                else:
+                    print(_event_line(event), flush=True)
+            if args.once:
+                break
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+    rebuilds = [e for e in w.events if isinstance(e, Rebuild)]
+    colds = [e for e in w.events if isinstance(e, ColdStart)]
+    from .report import _money
+    print(f"\nwatched: {len(rebuilds)} rebuild(s), premium {_money(sum(r.premium for r in rebuilds))}; {len(colds)} cold start(s), {_money(sum(c.write_cost for c in colds))}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="cachemiss", description=__doc__)
     ap.add_argument("--version", action="version", version=f"cachemiss {__version__}")
@@ -129,9 +210,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true")
     p.add_argument("--root", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_session)
+    p = sub.add_parser("watch", help="follow the transcripts and print each rebuild as it happens")
+    p.add_argument("--interval", type=float, default=5.0, help="seconds between polls (default 5)")
+    p.add_argument("--prime-hours", type=float, default=2.0, help="feed this much recent history first so live chains have their predecessor (default 2)")
+    p.add_argument("--once", action="store_true", help="one poll, then exit (for scripts and tests)")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--root", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_watch)
 
     argv = list(sys.argv[1:] if argv is None else argv)
-    subcommands = ("ledger", "why", "sessions", "session")
+    subcommands = ("ledger", "why", "sessions", "session", "watch")
     found = next((a for a in argv if a in subcommands), None)
     if found is None and not any(a in ("-h", "--help", "--version") for a in argv):
         argv = ["ledger", *argv]  # bare `cachemiss --since 24h` means the ledger

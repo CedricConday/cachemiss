@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cachemiss"
-version = "0.1.0"
+version = "0.2.0"
 description = "Explain why your Claude Code quota drained: every prompt-cache rebuild, its reason, its cost, and which sub-agent did it. Reads local transcripts only."
 readme = "README.md"
 license = {text = "MIT"}

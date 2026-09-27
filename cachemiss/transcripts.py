@@ -89,61 +89,102 @@ def _project_of(path: Path, root: Path) -> str:
         return path.parent.name
 
 
+def parse_record(d: dict, path: Path, project: str, is_sub: bool, seen: set[str]) -> Call | None:
+    """One transcript record to a Call, or None when it carries no API usage."""
+    if d.get("type") != "assistant":
+        return None
+    m = d.get("message") or {}
+    u = m.get("usage") or {}
+    if not u:
+        return None
+    if m.get("model") == "<synthetic>" or d.get("isApiErrorMessage"):
+        return None  # a failed request; no prompt was cached or read
+    rid = d.get("requestId") or m.get("id")
+    if rid:
+        if rid in seen:
+            return None
+        seen.add(rid)
+    ts = _parse_ts(d.get("timestamp", ""))
+    if ts is None:
+        return None
+    cc = u.get("cache_creation") or {}
+    diag = (m.get("diagnostics") or {}).get("cache_miss_reason") or {}
+    prompt = int(u.get("input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0)
+    if prompt == 0:
+        return None  # nothing was sent; keeps zero-usage blocks out of the chain
+    return Call(
+        ts=ts,
+        file=str(path),
+        project=project,
+        session_id=d.get("sessionId") or d.get("session_id") or path.stem,
+        is_subagent=bool(d.get("isSidechain")) or is_sub,
+        agent_id=d.get("agentId"),
+        agent_name=d.get("attributionAgent"),
+        model=m.get("model"),
+        version=d.get("version"),
+        request_id=rid,
+        uuid=d.get("uuid"),
+        input_tokens=int(u.get("input_tokens") or 0),
+        cache_creation=int(u.get("cache_creation_input_tokens") or 0),
+        cache_read=int(u.get("cache_read_input_tokens") or 0),
+        output_tokens=int(u.get("output_tokens") or 0),
+        creation_5m=int(cc.get("ephemeral_5m_input_tokens") or 0),
+        creation_1h=int(cc.get("ephemeral_1h_input_tokens") or 0),
+        reason=diag.get("type"),
+        missed=diag.get("cache_missed_input_tokens"),
+        quota=d.get("quotaLimits"),
+        effort=d.get("effort"),
+        slug=d.get("slug"),
+    )
+
+
+def _is_subagent_file(path: Path) -> bool:
+    return "subagents" in path.parts or path.name.startswith("agent-")
+
+
 def read_file(path: Path, root: Path = DEFAULT_ROOT) -> Iterator[Call]:
     seen: set[str] = set()
     project = _project_of(path, root)
-    is_sub = "subagents" in path.parts or path.name.startswith("agent-")
+    is_sub = _is_subagent_file(path)
     with open(path, errors="replace") as fh:
         for line in fh:
             try:
                 d = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if d.get("type") != "assistant":
-                continue
-            m = d.get("message") or {}
-            u = m.get("usage") or {}
-            if not u:
-                continue
-            if m.get("model") == "<synthetic>" or d.get("isApiErrorMessage"):
-                continue  # a failed request; no prompt was cached or read
-            rid = d.get("requestId") or m.get("id")
-            if rid:
-                if rid in seen:
-                    continue
-                seen.add(rid)
-            ts = _parse_ts(d.get("timestamp", ""))
-            if ts is None:
-                continue
-            cc = u.get("cache_creation") or {}
-            diag = (m.get("diagnostics") or {}).get("cache_miss_reason") or {}
-            prompt = int(u.get("input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0)
-            if prompt == 0:
-                continue  # nothing was sent; keeps zero-usage blocks out of the chain
-            yield Call(
-                ts=ts,
-                file=str(path),
-                project=project,
-                session_id=d.get("sessionId") or d.get("session_id") or path.stem,
-                is_subagent=bool(d.get("isSidechain")) or is_sub,
-                agent_id=d.get("agentId"),
-                agent_name=d.get("attributionAgent"),
-                model=m.get("model"),
-                version=d.get("version"),
-                request_id=rid,
-                uuid=d.get("uuid"),
-                input_tokens=int(u.get("input_tokens") or 0),
-                cache_creation=int(u.get("cache_creation_input_tokens") or 0),
-                cache_read=int(u.get("cache_read_input_tokens") or 0),
-                output_tokens=int(u.get("output_tokens") or 0),
-                creation_5m=int(cc.get("ephemeral_5m_input_tokens") or 0),
-                creation_1h=int(cc.get("ephemeral_1h_input_tokens") or 0),
-                reason=diag.get("type"),
-                missed=diag.get("cache_missed_input_tokens"),
-                quota=d.get("quotaLimits"),
-                effort=d.get("effort"),
-                slug=d.get("slug"),
-            )
+            call = parse_record(d, path, project, is_sub, seen)
+            if call is not None:
+                yield call
+
+
+def read_new(path: Path, offset: int, root: Path = DEFAULT_ROOT, seen: set[str] | None = None) -> tuple[list[Call], int]:
+    """Calls from the bytes appended to ``path`` since ``offset``; returns them and the new offset.
+
+    A partial last line (a record still being written) is left for the next read.
+    """
+    seen = set() if seen is None else seen
+    project = _project_of(path, root)
+    is_sub = _is_subagent_file(path)
+    calls: list[Call] = []
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        data = fh.read()
+    if not data:
+        return calls, offset
+    if not data.endswith(b"\n"):
+        cut = data.rfind(b"\n")
+        if cut < 0:
+            return calls, offset
+        data = data[: cut + 1]
+    for line in data.decode(errors="replace").splitlines():
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        call = parse_record(d, path, project, is_sub, seen)
+        if call is not None:
+            calls.append(call)
+    return calls, offset + len(data)
 
 
 def load_calls(root: Path = DEFAULT_ROOT, since: datetime | None = None) -> list[Call]:

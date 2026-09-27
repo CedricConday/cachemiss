@@ -12,8 +12,20 @@ cachemiss                 # the last 5 hours, the quota window
 cachemiss why             # each reason explained, with what to do about it
 cachemiss session <id>    # one session as a timeline
 cachemiss sessions        # sessions ranked by rebuild cost
+cachemiss watch           # follow the transcripts and print each rebuild as it lands
 cachemiss --since 7d --json
 ```
+
+## Watching live
+
+`cachemiss watch` polls the transcript directory (every 5 s by default), reads only the
+bytes appended since the last poll, and prints one ledger line per rebuild or cold start
+the moment its record lands, with the same reason, tokens-rewritten and premium columns
+as the ledger. On start it feeds the last two hours of history to the classifier
+silently, so a chain that is mid-conversation already has its predecessor and the first
+live call is judged against it rather than counted as a cold start. Ctrl-C prints the
+totals for the watched period. `--once` does a single poll for scripts; `--json` emits one
+object per event.
 
 ## What it shows
 

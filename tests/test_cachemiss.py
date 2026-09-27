@@ -3,10 +3,10 @@ from pathlib import Path
 
 import pytest
 
-from cachemiss.analysis import detect
-from cachemiss.cli import main
+from cachemiss.analysis import Classifier, ColdStart, Rebuild, detect
+from cachemiss.cli import Watcher, main
 from cachemiss.pricing import price_for
-from cachemiss.transcripts import load_calls
+from cachemiss.transcripts import load_calls, read_new
 from tests.synth import T0, healthy_loop, record, write
 
 
@@ -216,3 +216,70 @@ def test_cli_json_and_text(tmp_path, capsys):
     assert main(["--root", str(tmp_path), "session", "aaaaaaaa"]) == 0
     assert "REBUILD" in capsys.readouterr().out
     assert main(["--root", str(tmp_path), "sessions", "--since", "all"]) == 0
+
+
+def test_classifier_fed_one_call_at_a_time_matches_detect(tmp_path):
+    recs = healthy_loop(tmp_path)
+    last = recs[-1]
+    prompt = last["message"]["usage"]["cache_read_input_tokens"] + last["message"]["usage"]["cache_creation_input_tokens"] + 2000
+    late = record(T0 + timedelta(minutes=95), "aaaaaaaa-0000", prompt=prompt, read=0, wrote=prompt)
+    write(tmp_path / "proj" / "aaaaaaaa-0000.jsonl", recs + [late])
+    calls = load_calls(tmp_path)
+    clf = Classifier()
+    events = [e for e in (clf.feed(c) for c in calls) if e is not None]
+    batch = detect(calls)
+    assert [type(e).__name__ for e in events] == ["ColdStart"] * len(batch.cold_starts) + ["Rebuild"] * len(batch.rebuilds)
+    assert [e.rebuilt_tokens for e in events if isinstance(e, Rebuild)] == [r.rebuilt_tokens for r in batch.rebuilds]
+
+
+def test_read_new_returns_only_appended_records_and_holds_a_partial_line(tmp_path):
+    recs = healthy_loop(tmp_path)
+    path = tmp_path / "proj" / "aaaaaaaa-0000.jsonl"
+    seen: set = set()
+    calls, offset = read_new(path, 0, tmp_path, seen)
+    assert len(calls) == 6 and offset == path.stat().st_size
+    again, offset2 = read_new(path, offset, tmp_path, seen)
+    assert again == [] and offset2 == offset
+    import json
+
+    late = record(T0 + timedelta(minutes=95), "aaaaaaaa-0000", prompt=50_000, read=0, wrote=50_000)
+    line = json.dumps(late)
+    with open(path, "a") as fh:
+        fh.write(line[: len(line) // 2])  # a record still being written
+    part, offset3 = read_new(path, offset, tmp_path, seen)
+    assert part == [] and offset3 == offset
+    with open(path, "a") as fh:
+        fh.write(line[len(line) // 2 :] + "\n")
+    done, offset4 = read_new(path, offset3, tmp_path, seen)
+    assert len(done) == 1 and offset4 == path.stat().st_size
+
+
+def test_watcher_primes_silently_then_reports_only_new_events(tmp_path):
+    recs = healthy_loop(tmp_path)
+    path = tmp_path / "proj" / "aaaaaaaa-0000.jsonl"
+    w = Watcher(tmp_path, prime=None)  # prime=None: nothing fed, offsets at end of file
+    assert w.poll() == []
+    w2 = Watcher(tmp_path, prime=T0 - timedelta(days=1))  # feeds the history so the chain has a predecessor
+    assert w2.poll() == [] and len(w2.clf.last) == 1
+    last = recs[-1]
+    prompt = last["message"]["usage"]["cache_read_input_tokens"] + last["message"]["usage"]["cache_creation_input_tokens"] + 2000
+    late = record(T0 + timedelta(minutes=95), "aaaaaaaa-0000", prompt=prompt, read=0, wrote=prompt)
+    import json
+
+    with open(path, "a") as fh:
+        fh.write(json.dumps(late) + "\n")
+    events = w2.poll()
+    assert len(events) == 1 and isinstance(events[0], Rebuild) and events[0].reason == "ttl_expired"
+    assert w2.poll() == []
+    # a fresh chain appearing while watching is a cold start
+    sub = tmp_path / "proj" / "aaaaaaaa-0000" / "subagents" / "agent-z9.jsonl"
+    write(sub, [record(T0 + timedelta(minutes=96), "aaaaaaaa-0000", prompt=30_000, read=0, wrote=30_000, ttl="5m", sidechain=True, agent="z9")])
+    events = w2.poll()
+    assert len(events) == 1 and isinstance(events[0], ColdStart) and events[0].kind == "subagent_start"
+
+
+def test_watch_once_runs_from_the_cli(tmp_path, capsys):
+    healthy_loop(tmp_path)
+    assert main(["watch", "--once", "--root", str(tmp_path), "--prime-hours", "999999"]) == 0
+    out = capsys.readouterr().out
+    assert "watching" in out and "watched: 0 rebuild(s)" in out

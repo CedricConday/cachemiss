@@ -170,12 +170,47 @@ def infer_reason(call: Call, prev: Call | None, gap: timedelta | None, chain_ttl
     return "prefix_changed"
 
 
+class Classifier:
+    """Feeds calls one at a time, in time order, and classifies each as it arrives.
+
+    Holds the per-chain state (last call, TTL of the chain's entries) that
+    ``detect`` builds over a whole history; ``watch`` uses it on live records.
+    """
+
+    def __init__(self) -> None:
+        self.last: dict[str, Call] = {}
+        self.ttl_of: dict[str, str] = {}
+
+    def feed(self, call: Call) -> Rebuild | ColdStart | None:
+        prev = self.last.get(call.chain)
+        chain_ttl = self.ttl_of.get(call.chain, "1h" if not call.is_subagent else "5m")
+        self.last[call.chain] = call
+        self.ttl_of[call.chain] = chain_ttl_after(chain_ttl, call)
+        price = price_for(call.model)
+        if prev is None:
+            if call.cache_creation >= MIN_PROMPT:
+                kind = "subagent_start" if call.is_subagent else "session_start"
+                cost = call.cache_creation / 1e6 * price.write_per_m(call.ttl)
+                return ColdStart(call, kind, call.cache_creation, cost)
+            return None
+        gap = call.ts - prev.ts
+        previously_cached = prev.cache_read + prev.cache_creation
+        lost = call.missed if call.missed is not None else max(0, previously_cached - call.cache_read)
+        rebuilt = min(lost, call.cache_creation)
+        if rebuilt < MIN_PROMPT:
+            return None
+        reason = call.reason or infer_reason(call, prev, gap, chain_ttl)
+        share = call.cache_creation / call.prompt_tokens if call.prompt_tokens else 0.0
+        write_cost = rebuilt / 1e6 * price.write_per_m(call.ttl)
+        read_cost = rebuilt / 1e6 * price.read_per_m
+        return Rebuild(call, prev, reason, call.reason is None, rebuilt, gap, write_cost, read_cost, share, chain_ttl)
+
+
 def detect(calls: list[Call]) -> Summary:
     """Classify every call; ``calls`` must be in time order and may span chains."""
     summary = Summary(calls=len(calls))
     summary.sessions = len({c.session_id for c in calls})
-    last: dict[str, Call] = {}
-    ttl_of: dict[str, str] = {}
+    clf = Classifier()
     for call in calls:
         summary.prompt_tokens += call.prompt_tokens
         summary.cache_read += call.cache_read
@@ -184,32 +219,11 @@ def detect(calls: list[Call]) -> Summary:
         summary.output_tokens += call.output_tokens
         if call.reason:
             summary.diagnostics_present += 1
-        prev = last.get(call.chain)
-        chain_ttl = ttl_of.get(call.chain, "1h" if not call.is_subagent else "5m")
-        last[call.chain] = call
-        ttl_of[call.chain] = chain_ttl_after(chain_ttl, call)
-        price = price_for(call.model)
-
-        if prev is None:
-            if call.cache_creation >= MIN_PROMPT:
-                kind = "subagent_start" if call.is_subagent else "session_start"
-                cost = call.cache_creation / 1e6 * price.write_per_m(call.ttl)
-                summary.cold_starts.append(ColdStart(call, kind, call.cache_creation, cost))
-            continue
-
-        gap = call.ts - prev.ts
-        previously_cached = prev.cache_read + prev.cache_creation
-        lost = call.missed if call.missed is not None else max(0, previously_cached - call.cache_read)
-        rebuilt = min(lost, call.cache_creation)
-        if rebuilt < MIN_PROMPT:
-            continue
-        reason = call.reason or infer_reason(call, prev, gap, chain_ttl)
-        share = call.cache_creation / call.prompt_tokens if call.prompt_tokens else 0.0
-        write_cost = rebuilt / 1e6 * price.write_per_m(call.ttl)
-        read_cost = rebuilt / 1e6 * price.read_per_m
-        summary.rebuilds.append(
-            Rebuild(call, prev, reason, call.reason is None, rebuilt, gap, write_cost, read_cost, share, chain_ttl)
-        )
+        event = clf.feed(call)
+        if isinstance(event, ColdStart):
+            summary.cold_starts.append(event)
+        elif isinstance(event, Rebuild):
+            summary.rebuilds.append(event)
     return summary
 
 
