@@ -1,5 +1,7 @@
 # cachemiss
 
+[![tests](https://github.com/CedricConday/cachemiss/actions/workflows/tests.yml/badge.svg)](https://github.com/CedricConday/cachemiss/actions/workflows/tests.yml)
+
 **Why did my Claude Code quota drain?** One command over the transcripts Claude Code
 already keeps on your disk: every prompt-cache rebuild, why it happened, what it cost,
 and which sub-agent did it. Nothing leaves your machine.
